@@ -46,6 +46,7 @@ import {
   Image as RNImage,
   type ImageStyle,
   InteractionManager,
+  KeyboardAvoidingView,
   type LayoutChangeEvent,
   Linking,
   Modal,
@@ -110,7 +111,7 @@ import {
 } from "../lib/local-mirror";
 import { AccountSecurityPanel } from "./AccountSecurityModal";
 import { beginEditorStartup, markStartup, recordEditorStartup } from "../lib/startup-performance";
-import { prepareUploadAsset } from "../lib/mobile-image-upload";
+import { prepareUploadAsset, type MobileImageUploadAsset } from "../lib/mobile-image-upload";
 import MobileWebClipCapture from "../components/MobileWebClipCapture";
 import LocalTiptapEditor, { type LocalTiptapEditorRef } from "../components/LocalTiptapEditor";
 import { SAFE_DOM_WEBVIEW_PROPS } from "../lib/mobile-dom";
@@ -122,14 +123,17 @@ import { MobileCreateChoiceModal, MobileTemplatePickerModal } from "../component
 import { resolveMobileThemeStyles, useMobileTheme } from "../lib/mobile-theme";
 import { useMobileUpdate } from "../lib/mobile-update";
 import { createMemoSeedHasContent, type MobileCreateMemoSeed } from "../lib/mobile-templates";
+import { createMobileDraftWriteBarrier } from "../lib/mobile-draft-write-barrier";
 import { MobileMermaidDiagram, MobileMermaidProvider } from "../components/MobileMermaid";
 import { getMobileMarkdownFenceLanguage, trimMobileMarkdownFenceContent } from "../lib/mobile-mermaid";
 import {
   buildMobileWebClipDraft,
   buildMobileWebClipDraftFromRenderedPage,
+  getSharedImages,
   getSharedWebUrl,
   isWeChatArticleUrl,
   type MobileRenderedWebPage,
+  type MobileSharedImage,
   type MobileSharedPayload,
   type MobileWebClipDraft,
 } from "../lib/mobile-web-clip";
@@ -219,9 +223,13 @@ type RichEditingSession = {
 type MobileMemoUpdateMutation = UseMutationResult<MemoDetail, Error, { memo: MemoDetail; payload: MobileMemoUpdatePayload }>;
 
 export const WorkspaceScreen = ({
+  incomingShareError = null,
+  incomingShareIsResolving = false,
   incomingSharePayloads = [],
   onIncomingShareHandled,
 }: {
+  incomingShareError?: Error | null;
+  incomingShareIsResolving?: boolean;
   incomingSharePayloads?: MobileSharedPayload[];
   onIncomingShareHandled?: () => void;
 }) => {
@@ -249,6 +257,7 @@ export const WorkspaceScreen = ({
   const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
   const [incomingClipDraft, setIncomingClipDraft] = useState<MobileWebClipDraft | null>(null);
   const [incomingClipCaptureUrl, setIncomingClipCaptureUrl] = useState<string | null>(null);
+  const [incomingShareImages, setIncomingShareImages] = useState<MobileSharedImage[]>([]);
   const [isImportingShare, setIsImportingShare] = useState(false);
   const [notesActionsOpen, setNotesActionsOpen] = useState(false);
   const [notebookPickerOpen, setNotebookPickerOpen] = useState(false);
@@ -264,6 +273,7 @@ export const WorkspaceScreen = ({
   onIncomingShareHandledRef.current = onIncomingShareHandled;
   const debouncedSearchText = useDebouncedValue(searchText.trim(), 250);
   const incomingShareUrl = useMemo(() => getSharedWebUrl(incomingSharePayloads), [incomingSharePayloads]);
+  const sharedImages = useMemo(() => getSharedImages(incomingSharePayloads), [incomingSharePayloads]);
   const handleMemoIdRemapped = useCallback((temporaryId: string, memo: MemoDetail) => {
     setSelectedMemoId((current) => current === temporaryId ? memo.id : current);
     setSelectedMemoIds((current) => {
@@ -614,6 +624,7 @@ export const WorkspaceScreen = ({
     setSelectionMode(false);
     setSelectedMemoIds(new Set());
     setIncomingClipDraft(null);
+    setIncomingShareImages([]);
     setCreateSeed(seed);
     setCreateOpen(true);
   }, []);
@@ -666,11 +677,58 @@ export const WorkspaceScreen = ({
   }, [finishIncomingShare, incomingClipCaptureUrl, openIncomingClipDraft]);
 
   useEffect(() => {
+    if (incomingShareIsResolving) {
+      return;
+    }
+
+    if (incomingShareError && sharedImages.some((image) => !image.uri.startsWith("file:"))) {
+      if (processedShareUrlRef.current !== "invalid-binary-share") {
+        processedShareUrlRef.current = "invalid-binary-share";
+        Alert.alert("无法读取分享图片", incomingShareError.message || "请重新分享后再试。");
+        onIncomingShareHandledRef.current?.();
+      }
+      return;
+    }
+
+    if (sharedImages.length > 0) {
+      const shareKey = `images:${sharedImages.map((image) => image.uri).join("|")}`;
+      if (processedShareUrlRef.current === shareKey) {
+        return;
+      }
+      if (notebooks.length === 0) {
+        if (notebooksQuery.isSuccess) {
+          processedShareUrlRef.current = shareKey;
+          Alert.alert("无法保存图片", "请先在 EdgeEver 中创建一个笔记本。");
+          onIncomingShareHandledRef.current?.();
+        }
+        return;
+      }
+
+      processedShareUrlRef.current = shareKey;
+      beginEditorStartup();
+      setSelectedMemoId(null);
+      setIncomingClipDraft(null);
+      setIncomingShareImages(sharedImages);
+      setCreateSeed({
+        contentMarkdown: "",
+        tagsText: "",
+        title: sharedImages.length === 1 ? "分享的图片" : `分享的图片（${sharedImages.length} 张）`,
+      });
+      setActiveView("notes");
+      setMemoView("notebook");
+      setCreateOpen(true);
+      onIncomingShareHandledRef.current?.();
+      return;
+    }
+
     const sourceUrl = incomingShareUrl;
     if (!sourceUrl) {
       if (incomingSharePayloads.length > 0 && processedShareUrlRef.current !== "invalid-share") {
         processedShareUrlRef.current = "invalid-share";
-        Alert.alert("无法剪藏", "分享内容里没有可识别的网页链接。");
+        Alert.alert(
+          "无法读取分享内容",
+          incomingShareError?.message || "分享内容里没有可识别的网页链接或图片。",
+        );
         onIncomingShareHandledRef.current?.();
         return;
       }
@@ -721,11 +779,14 @@ export const WorkspaceScreen = ({
       active = false;
     };
   }, [
+    incomingShareError,
+    incomingShareIsResolving,
     incomingSharePayloads.length,
     incomingShareUrl,
     notebooks.length,
     notebooksQuery.isSuccess,
     openIncomingClipDraft,
+    sharedImages,
   ]);
 
   useEffect(() => {
@@ -1194,10 +1255,12 @@ export const WorkspaceScreen = ({
         defaultNotebookId={createMemoNotebookId}
         imageCompressionEnabled={imageCompressionEnabled}
         initialDraft={incomingClipDraft ?? createSeed}
+        initialSharedImages={incomingShareImages}
         notebooks={notebooks}
         onCreated={() => {
           setCreateOpen(false);
           setIncomingClipDraft(null);
+          setIncomingShareImages([]);
           setCreateSeed(null);
           setActiveView("notes");
           setMemoView("notebook");
@@ -1206,6 +1269,7 @@ export const WorkspaceScreen = ({
         onDismiss={() => {
           setCreateOpen(false);
           setIncomingClipDraft(null);
+          setIncomingShareImages([]);
           setCreateSeed(null);
         }}
         onQueued={runForcedSync}
@@ -1274,6 +1338,7 @@ export const WorkspaceScreen = ({
       ) : null}
 
       <MemoDetailModal
+        initialSearchQuery={selectedMemoId ? searchText.trim() : ""}
         isDeleting={deleteMemoMutation.isPending}
         isLoading={memoDetailQuery.isLoading}
         isRestoring={restoreMemoMutation.isPending}
@@ -1684,6 +1749,7 @@ const CreateMemoModal = ({
   defaultNotebookId,
   imageCompressionEnabled,
   initialDraft,
+  initialSharedImages = [],
   notebooks,
   onCreated,
   onDismiss,
@@ -1696,6 +1762,7 @@ const CreateMemoModal = ({
   defaultNotebookId: string;
   imageCompressionEnabled: boolean;
   initialDraft?: MobileCreateMemoSeed | MobileWebClipDraft | null;
+  initialSharedImages?: MobileSharedImage[];
   notebooks: Notebook[];
   onCreated: (memo: MemoDetail) => void;
   onDismiss: () => void;
@@ -1721,6 +1788,7 @@ const CreateMemoModal = ({
   const contentJsonRef = useRef<TiptapDoc>(markdownToDoc(""));
   const contentMarkdownRef = useRef("");
   const draftVersionRef = useRef(0);
+  const draftWriteBarrier = useMemo(createMobileDraftWriteBarrier, []);
   const flushResolverRef = useRef<(() => void) | null>(null);
   const materializedMemoRef = useRef<MemoDetail | null>(null);
   const [notebookId, setNotebookId] = useState(fallbackNotebookId);
@@ -1734,7 +1802,10 @@ const CreateMemoModal = ({
   const [editorReady, setEditorReady] = useState(false);
   const [imageOperation, setImageOperation] = useState<"idle" | "creating" | "uploading">("idle");
   const imageOperationRef = useRef(imageOperation);
+  const sharedImagesHandledRef = useRef(false);
   const createPendingRef = useRef(false);
+  const submitStartedRef = useRef(false);
+  const [submitStarted, setSubmitStarted] = useState(false);
   const [resourceTarget, setResourceTarget] = useState<MobileResourceTarget | null>(null);
   const { pickUploadAsset, uploadSourcePicker } = useMobileEditorUploadAsset();
   const targetNotebookId = notebookId || fallbackNotebookId;
@@ -1750,7 +1821,7 @@ const CreateMemoModal = ({
   targetNotebookIdRef.current = targetNotebookId;
   imageOperationRef.current = imageOperation;
 
-  const { cancelSelectionAi, requestSelectionAi } = useMobileSelectionAi({
+  const { aiPromptsJson, cancelSelectionAi, requestSelectionAi } = useMobileSelectionAi({
     client,
     editorRef,
     resolvedLocale,
@@ -1793,12 +1864,12 @@ const CreateMemoModal = ({
   // Component is only mounted while create is open — init once on mount.
   useEffect(() => {
     let active = true;
+    setDraftLoaded(false);
     setEditorReady(false);
     setTemplatePickerOpen(false);
     userEditedSinceOpenRef.current = false;
     draftVersionRef.current = 0;
 
-    // Mount DomWebView immediately — do not wait on AsyncStorage before cold start.
     if (initialDraft) {
       const markdown = initialDraft.contentMarkdown;
       contentMarkdownRef.current = markdown;
@@ -1821,14 +1892,14 @@ const CreateMemoModal = ({
     setContentMarkdown("");
     setNotebookId(fallbackNotebookId);
     setDirty(false);
-    setDraftLoaded(true);
 
     void readMobileNewMemoDraft(dataScope).then((draft) => {
-      if (!active || !draft) {
+      if (!active) {
         return;
       }
       // Don't clobber if the user already started typing.
-      if (userEditedSinceOpenRef.current) {
+      if (!draft || userEditedSinceOpenRef.current) {
+        setDraftLoaded(true);
         return;
       }
       const restoredNotebookId = notebooksRef.current.some((notebook) => notebook.id === draft.notebookId)
@@ -1843,8 +1914,11 @@ const CreateMemoModal = ({
       setContentMarkdown(markdown);
       setNotebookId(restoredNotebookId);
       setDirty(false);
-      // setContent no longer steals focus — keep the title IME if the user is already typing.
-      pushBodyToEditor(doc);
+      setDraftLoaded(true);
+    }).catch(() => {
+      if (active) {
+        setDraftLoaded(true);
+      }
     });
     return () => {
       active = false;
@@ -1855,6 +1929,33 @@ const CreateMemoModal = ({
   const isWebClipDraft = Boolean(
     initialDraft && "sourceUrl" in initialDraft && typeof initialDraft.sourceUrl === "string" && initialDraft.sourceUrl.length > 0
   );
+
+  const persistCurrentDraft = useCallback(() => {
+    const materializedMemo = materializedMemoRef.current;
+    const currentTitle = titleRef.current;
+    const currentContentMarkdown = contentMarkdownRef.current;
+    const currentNotebookId = targetNotebookIdRef.current;
+    const currentTagsText = tagsTextRef.current;
+    const updatedAt = new Date().toISOString();
+
+    return draftWriteBarrier.enqueue(() => materializedMemo
+      ? writeMobileMemoDraft({
+        memoId: materializedMemo.id,
+        expectedRevision: materializedMemo.revision,
+        title: currentTitle,
+        contentMarkdown: currentContentMarkdown,
+        notebookId: currentNotebookId,
+        tagsText: currentTagsText,
+        updatedAt,
+      })
+      : writeMobileNewMemoDraft(dataScope, {
+        title: currentTitle,
+        contentMarkdown: currentContentMarkdown,
+        notebookId: currentNotebookId,
+        tagsText: currentTagsText,
+        updatedAt,
+      }));
+  }, [dataScope, draftWriteBarrier]);
 
   const applyTemplateSeed = useCallback((seed: MobileCreateMemoSeed) => {
     const markdown = seed.contentMarkdown;
@@ -1894,32 +1995,14 @@ const CreateMemoModal = ({
     }
     const draftVersion = draftVersionRef.current;
     const timeout = setTimeout(() => {
-      const materializedMemo = materializedMemoRef.current;
-      const writeDraft = materializedMemo
-        ? writeMobileMemoDraft({
-          memoId: materializedMemo.id,
-          expectedRevision: materializedMemo.revision,
-          title,
-          contentMarkdown: contentMarkdownRef.current,
-          notebookId: targetNotebookId,
-          tagsText,
-          updatedAt: new Date().toISOString(),
-        })
-        : writeMobileNewMemoDraft(dataScope, {
-          title,
-          contentMarkdown: contentMarkdownRef.current,
-          notebookId: targetNotebookId,
-          tagsText,
-          updatedAt: new Date().toISOString(),
-        });
-      void writeDraft.then(() => {
-        if (draftVersionRef.current === draftVersion) {
+      void persistCurrentDraft().then((written) => {
+        if (written && !submitStartedRef.current && draftVersionRef.current === draftVersion) {
           setDirty(false);
         }
-      });
+      }).catch(() => undefined);
     }, 350);
     return () => clearTimeout(timeout);
-  }, [contentMarkdown, dataScope, dirty, draftLoaded, isWebClipDraft, tagsText, targetNotebookId, title]);
+  }, [contentMarkdown, dirty, draftLoaded, isWebClipDraft, persistCurrentDraft, tagsText, targetNotebookId, title]);
 
   const createMutation = useMutation({
     mutationFn: async () => {
@@ -1986,6 +2069,15 @@ const CreateMemoModal = ({
     },
     onSuccess: async (memo) => {
       const materializedMemoId = materializedMemoRef.current?.id ?? null;
+      // Wait for any already-running AsyncStorage write before removing the
+      // draft. Nothing queued after submit began is allowed to recreate it.
+      await draftWriteBarrier.blockAndDrain();
+      if (!isWebClipDraft) {
+        await clearMobileNewMemoDraft(dataScope);
+      }
+      if (materializedMemoId) {
+        await clearMobileMemoDraft(materializedMemoId);
+      }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["mobile", "notebooks"] }),
         queryClient.invalidateQueries({ queryKey: ["mobile", "memos"] }),
@@ -1998,19 +2090,23 @@ const CreateMemoModal = ({
       materializedMemoRef.current = null;
       draftVersionRef.current += 1;
       setDirty(false);
-      if (!isWebClipDraft) {
-        await clearMobileNewMemoDraft(dataScope);
-      }
-      if (materializedMemoId) {
-        await clearMobileMemoDraft(materializedMemoId);
-      }
       void onQueued();
       onCreated(memo);
     },
+    onError: () => {
+      submitStartedRef.current = false;
+      draftWriteBarrier.unblock();
+      setSubmitStarted(false);
+      draftVersionRef.current += 1;
+      setDirty(true);
+      if (!isWebClipDraft) {
+        void persistCurrentDraft().catch(() => undefined);
+      }
+    },
   });
   createPendingRef.current = createMutation.isPending;
-  const canSubmitCreateMemo = Boolean(targetNotebookId) && !createMutation.isPending && imageOperation === "idle";
-  const canUseTemplate = imageOperation === "idle" && !createMutation.isPending;
+  const canSubmitCreateMemo = Boolean(targetNotebookId) && !submitStarted && !createMutation.isPending && imageOperation === "idle";
+  const canUseTemplate = editorReady && imageOperation === "idle" && !submitStarted && !createMutation.isPending;
 
   const materializeMemoForImage = async () => {
     if (materializedMemoRef.current) {
@@ -2038,10 +2134,9 @@ const CreateMemoModal = ({
     return response.memo;
   };
 
-  const pickAndUploadImage = async () => {
+  const uploadImageAsset = async (asset: MobileImageUploadAsset | null) => {
     let uploadId: string | null = null;
     try {
-      const asset = await pickUploadAsset();
       if (!asset) {
         return;
       }
@@ -2066,7 +2161,27 @@ const CreateMemoModal = ({
     }
   };
 
+  const pickAndUploadImage = async () => {
+    const asset = await pickUploadAsset();
+    await uploadImageAsset(asset);
+  };
+
+  useEffect(() => {
+    if (!editorReady || sharedImagesHandledRef.current || initialSharedImages.length === 0) {
+      return;
+    }
+    sharedImagesHandledRef.current = true;
+    void (async () => {
+      for (const image of initialSharedImages) {
+        await uploadImageAsset(image);
+      }
+    })();
+  }, [editorReady, initialSharedImages]);
+
   const markDirty = () => {
+    if (submitStartedRef.current) {
+      return;
+    }
     userEditedSinceOpenRef.current = true;
     draftVersionRef.current += 1;
     setDirty(true);
@@ -2074,14 +2189,25 @@ const CreateMemoModal = ({
 
   const flushEditor = () => flushMobileEditor(editorRef, flushResolverRef);
 
-  const requestClose = async () => {
-    if (createPendingRef.current || imageOperationRef.current !== "idle") {
+  const submitCreateMemo = async () => {
+    if (submitStartedRef.current || createPendingRef.current || imageOperationRef.current !== "idle") {
       return;
     }
-    await flushEditor();
-    // Match prior Android create behavior: back commits the note (even if empty draft).
-    createMutation.mutate();
+    submitStartedRef.current = true;
+    setSubmitStarted(true);
+    const draftsDrained = draftWriteBarrier.blockAndDrain();
+    try {
+      await flushEditor();
+      await draftsDrained;
+      createMutation.mutate();
+    } catch {
+      submitStartedRef.current = false;
+      draftWriteBarrier.unblock();
+      setSubmitStarted(false);
+    }
   };
+
+  const requestClose = () => submitCreateMemo();
 
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
@@ -2118,6 +2244,7 @@ const CreateMemoModal = ({
   const editorElement = useMemo(() => draftLoaded && baseUrl ? (
     <LocalTiptapEditor
       autoFocus
+      aiPromptsJson={aiPromptsJson}
       baseUrl={baseUrl}
       content={contentJsonRef.current}
       dom={{
@@ -2151,17 +2278,17 @@ const CreateMemoModal = ({
       locale={resolvedLocale}
       theme={resolvedTheme}
     />
-  ) : null, [baseUrl, cancelSelectionAi, draftLoaded, loadEditorResource, requestSelectionAi, resolvedLocale, resolvedTheme, scheduleBodyKeyboard, selectResource]);
+  ) : null, [aiPromptsJson, baseUrl, cancelSelectionAi, draftLoaded, loadEditorResource, pushBodyToEditor, requestSelectionAi, resolvedLocale, resolvedTheme, scheduleBodyKeyboard, selectResource]);
 
   return (
     <SafeAreaView edges={["top", "left", "right", "bottom"]} style={styles.createMemoSafeArea}>
       <View style={styles.createMemoHeader}>
-        <Pressable accessibilityLabel="返回" accessibilityRole="button" disabled={createMutation.isPending || imageOperation !== "idle"} onPress={() => void requestClose()} style={styles.createMemoBackButton}>
-          <ChevronLeft color={createMutation.isPending || imageOperation !== "idle" ? "#cbd5e1" : "#0f172a"} size={30} />
+        <Pressable accessibilityLabel="返回" accessibilityRole="button" disabled={submitStarted || createMutation.isPending || imageOperation !== "idle"} onPress={() => void requestClose()} style={styles.createMemoBackButton}>
+          <ChevronLeft color={submitStarted || createMutation.isPending || imageOperation !== "idle" ? "#cbd5e1" : "#0f172a"} size={30} />
         </Pressable>
         <View style={styles.createMemoHeaderActions}>
-          <Text style={[styles.createMemoStatus, createMutation.isPending && styles.createMemoStatusActive]}>
-            {imageOperation === "creating" ? "正在创建" : imageOperation === "uploading" ? "正在上传" : createMutation.isPending || dirty ? "保存中" : editorReady ? "已保存" : "准备中"}
+          <Text style={[styles.createMemoStatus, (submitStarted || createMutation.isPending) && styles.createMemoStatusActive]}>
+            {imageOperation === "creating" ? "正在创建" : imageOperation === "uploading" ? "正在上传" : submitStarted || createMutation.isPending || dirty ? "保存中" : editorReady ? "已保存" : "准备中"}
           </Text>
           <Pressable
             accessibilityLabel={translate("模板")}
@@ -2175,10 +2302,10 @@ const CreateMemoModal = ({
           <Pressable
             accessibilityLabel="完成新建笔记"
             disabled={!canSubmitCreateMemo}
-            onPress={() => void flushEditor().then(() => createMutation.mutate())}
+            onPress={() => void submitCreateMemo()}
             style={[styles.createMemoDoneButton, !canSubmitCreateMemo && styles.createMemoDoneButtonDisabled]}
           >
-            {createMutation.isPending ? <ActivityIndicator color="#64748b" size="small" /> : <Text style={[styles.createMemoDoneText, !canSubmitCreateMemo && styles.createMemoDoneTextDisabled]}>完成</Text>}
+            {submitStarted || createMutation.isPending ? <ActivityIndicator color="#64748b" size="small" /> : <Text style={[styles.createMemoDoneText, !canSubmitCreateMemo && styles.createMemoDoneTextDisabled]}>完成</Text>}
           </Pressable>
         </View>
       </View>
@@ -2562,7 +2689,7 @@ const RichEditorModal = ({
   };
 
   const flushEditor = () => flushMobileEditor(editorRef, flushResolverRef);
-  const { cancelSelectionAi, requestSelectionAi } = useMobileSelectionAi({
+  const { aiPromptsJson, cancelSelectionAi, requestSelectionAi } = useMobileSelectionAi({
     client,
     editorRef,
     resolvedLocale,
@@ -2654,6 +2781,7 @@ const RichEditorModal = ({
     () => memo && baseUrl ? (
       <LocalTiptapEditor
         autoFocus
+        aiPromptsJson={aiPromptsJson}
         baseUrl={baseUrl}
         content={contentJsonRef.current}
         dom={{
@@ -2693,7 +2821,7 @@ const RichEditorModal = ({
         theme={resolvedTheme}
       />
     ) : null,
-    [baseUrl, cancelSelectionAi, loadEditorResource, memo?.id, requestSelectionAi, resolvedLocale, resolvedTheme, selectResource]
+    [aiPromptsJson, baseUrl, cancelSelectionAi, loadEditorResource, memo?.id, requestSelectionAi, resolvedLocale, resolvedTheme, selectResource]
   );
 
   useEffect(() => {
@@ -2727,6 +2855,11 @@ const RichEditorModal = ({
 
   return (
     <SafeAreaView style={styles.richEditorSafeArea}>
+      <KeyboardAvoidingView
+        behavior="height"
+        enabled={Platform.OS === "android"}
+        style={styles.richEditorKeyboardAvoiding}
+      >
         <View style={styles.createMemoHeader}>
           <Pressable accessibilityLabel="返回" accessibilityRole="button" disabled={saving || uploading} onPress={() => void requestClose()} style={styles.createMemoBackButton}>
             <ChevronLeft color={saving || uploading ? "#cbd5e1" : "#0f172a"} size={30} />
@@ -2810,6 +2943,7 @@ const RichEditorModal = ({
           target={resourceTarget}
         />
         {uploadSourcePicker}
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 };
